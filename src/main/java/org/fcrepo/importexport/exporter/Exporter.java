@@ -21,6 +21,7 @@ import static org.apache.commons.codec.binary.Hex.encodeHex;
 import static org.apache.commons.io.FileUtils.byteCountToDisplaySize;
 import static org.apache.jena.rdf.model.ModelFactory.createDefaultModel;
 import static org.apache.jena.rdf.model.ResourceFactory.createProperty;
+import static org.apache.jena.riot.RDFLanguages.contentTypeToLang;
 import static org.fcrepo.importexport.common.FcrepoConstants.CONTAINER;
 import static org.fcrepo.importexport.common.FcrepoConstants.NON_RDF_SOURCE;
 import static org.fcrepo.importexport.common.TransferProcess.fileForBinary;
@@ -28,6 +29,8 @@ import static org.fcrepo.importexport.common.TransferProcess.fileForExternalReso
 import static org.fcrepo.importexport.common.TransferProcess.fileForURI;
 import static org.slf4j.LoggerFactory.getLogger;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -66,11 +69,14 @@ import org.fcrepo.importexport.common.TransferProcess;
 
 import org.apache.jena.rdf.model.Model;
 import org.apache.jena.rdf.model.NodeIterator;
+import org.apache.jena.rdf.model.RDFNode;
+import org.apache.jena.riot.RDFDataMgr;
 import org.slf4j.Logger;
 
 /**
  * Fedora Export Utility
  *
+ * @author lsitu
  * @author awoods
  * @author escowles
  * @since 2016-08-29
@@ -265,7 +271,7 @@ public class Exporter implements TransferProcess {
                     fileForBinary(uri, null, null, config.getBaseDirectory());
 
             logger.info("Exporting binary: {}", uri);
-            writeResponse(response, describedby, file);
+            writeResponse(uri, response.getBody(), describedby, file);
             exportLogger.info("export {} to {}", uri, file.getAbsolutePath());
             successCount.incrementAndGet();
         }
@@ -281,36 +287,73 @@ public class Exporter implements TransferProcess {
         try (FcrepoResponse response = client().get(uri).accept(config.getRdfLanguage()).perform()) {
             checkValidResponse(response, uri);
             logger.info("Exporting description: {}", uri);
-            writeResponse(response, null, file);
+
+            final Model model = filterBinaryReferences(uri,
+                    createDefaultModel().read(response.getBody(), null, config.getRdfLanguage()));
+
+            try (final ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+                RDFDataMgr.write(out, model, contentTypeToLang(config.getRdfLanguage()));
+                final ByteArrayInputStream in = new ByteArrayInputStream(out.toByteArray());
+                writeResponse(uri, in, null, file);
+            }
+
             exportLogger.info("export {} to {}", uri, file.getAbsolutePath());
             successCount.incrementAndGet();
+
+            exportMembers(model);
+
         } catch ( Exception ex ) {
             ex.printStackTrace();
             exportLogger.error(String.format("Error exporting description: {}, Cause: {}", uri, ex.getMessage()), ex);
         }
-
-        exportMembers(file);
     }
-    private void exportMembers(final File file) {
-        try {
-            final Model model = createDefaultModel().read(new FileInputStream(file), null, config.getRdfLanguage());
-            for (final String p : config.getPredicates()) {
-                for (final NodeIterator it = model.listObjectsOfProperty(createProperty(p)); it.hasNext();) {
-                    export(URI.create(it.nextNode().toString()));
-                }
+    private void exportMembers(final Model model) {
+        for (final String p : config.getPredicates()) {
+            for (final NodeIterator it = model.listObjectsOfProperty(createProperty(p)); it.hasNext();) {
+                export(URI.create(it.nextNode().toString()));
             }
-        } catch (FileNotFoundException ex) {
-            logger.warn("Unable to parse file: {}", ex.toString());
         }
     }
-    void writeResponse(final FcrepoResponse response, final List<URI> describedby, final File file)
+
+    /**
+     * Filter the binary resource references in the model
+     * @param model
+     * @return
+     * @throws FcrepoOperationFailedException
+     * @throws IOException
+     */
+    private Model filterBinaryReferences(final URI uri, final Model model) throws IOException,
+            FcrepoOperationFailedException {
+
+        if (config.isIncludeBinaries()) {
+            return model;
+        }
+
+        // find the binary resource references with the member predicates remove them
+        for (final String p : config.getPredicates()) {
+            for (final NodeIterator it = model.listObjectsOfProperty(createProperty(p)); it.hasNext();) {
+                final RDFNode node = it.nextNode();
+                try (final FcrepoResponse resp = client().head(URI.create(node.toString())).disableRedirects()
+                        .perform()) {
+                    checkValidResponse(resp, uri);
+                    final List<URI> linkHeaders = resp.getLinkHeaders("type");
+                    if (linkHeaders.contains(binaryURI)) {
+                        model.removeAll(null, null, node);
+                    }
+                }
+            }
+        }
+        return model;
+    }
+
+    void writeResponse(final URI uri, final InputStream in, final List<URI> describedby, final File file)
             throws IOException, FcrepoOperationFailedException {
         if (!file.getParentFile().exists()) {
             file.getParentFile().mkdirs();
         }
         try (OutputStream out = new FileOutputStream(file)) {
-            copy(response.getBody(), out);
-            logger.info("Exported {} to {}", response.getUrl(), file.getAbsolutePath());
+            copy(in, out);
+            logger.info("Exported {} to {}", uri, file.getAbsolutePath());
 
             if (md5FileMap != null) {
                 md5FileMap.put(file, new String(encodeHex(md5.digest())));
